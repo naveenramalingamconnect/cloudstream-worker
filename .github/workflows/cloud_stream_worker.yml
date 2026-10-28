@@ -1,0 +1,53 @@
+name: CloudStream Zero-Disk Transfer Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Opaque Transfer Job ID"
+        required: true
+        type: string
+      encrypted_payload:
+        description: "Fernet/AES Encrypted Job Payload (Zero-Knowledge Ciphertext)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  cloud-stream-transfer:
+    name: "CloudStream RAM Pipe #${{ inputs.job_id }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout Worker Engine
+        uses: actions/checkout@v4
+
+      - name: Set Up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Minimal Stream Dependencies
+        run: |
+          python -m pip install --upgrade pip --quiet
+          python -m pip install -r requirements-worker.txt --quiet
+
+      - name: Execute Encrypted RAM-to-Drive Stream (32 MB Chunks)
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          ENCRYPTED_PAYLOAD: ${{ inputs.encrypted_payload }}
+          WORKER_PAYLOAD_SECRET: ${{ secrets.WORKER_PAYLOAD_SECRET }}
+        run: |
+          python worker/run_transfer.py
+
+      - name: Upload Encrypted Checkpoint Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-checkpoint-job-${{ inputs.job_id }}
+          path: worker_result.enc
+          if-no-files-found: ignore
+          retention-days: 2
