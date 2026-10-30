@@ -12,6 +12,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: cloudstream-job-${{ inputs.job_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   actions: read
