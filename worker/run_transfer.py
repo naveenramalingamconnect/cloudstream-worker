@@ -65,6 +65,49 @@ def write_encrypted_checkpoint(secret_key: str, state: dict[str, Any], path: str
         fp.write(token)
 
 
+class ProgressReporter:
+    """Sends throttled, Fernet-encrypted progress updates to the app (zero-knowledge: no URL/filename).
+
+    Failures are swallowed on purpose: a reporting hiccup must never interrupt a transfer.
+    """
+
+    def __init__(
+        self,
+        report_url: str | None,
+        secret_key: str,
+        item_id: int,
+        min_interval: float = 10.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.report_url = report_url
+        self.secret_key = secret_key
+        self.item_id = item_id
+        self.min_interval = min_interval
+        self.transport = transport
+        self._last = 0.0
+
+    def send(self, state: dict[str, Any], force: bool = False) -> None:
+        if not self.report_url:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last) < self.min_interval:
+            return
+        self._last = now
+        try:
+            body = dict(state)
+            body["item_id"] = self.item_id
+            token = Fernet(self.secret_key.encode("utf-8")).encrypt(
+                json.dumps(body, separators=(",", ":")).encode("utf-8")
+            ).decode("utf-8")
+            kwargs: dict[str, Any] = {"timeout": 10.0}
+            if self.transport is not None:
+                kwargs["transport"] = self.transport
+            with httpx.Client(**kwargs) as client:
+                client.post(self.report_url, json={"token": token})
+        except Exception:
+            pass
+
+
 def ensure_access_token(token_bundle: dict[str, Any]) -> str:
     access_token = token_bundle.get("access_token", "")
     refresh_token = token_bundle.get("refresh_token", "")
@@ -182,7 +225,7 @@ def upload_chunk(
     raise RuntimeError(f"Chunk upload failed at offset {start_byte} with HTTP {resp.status_code}.")
 
 
-def run_worker_job(
+def _run_worker_job_impl(
     encrypted_payload: str,
     secret_key: str,
     *,
@@ -191,6 +234,7 @@ def run_worker_job(
     source_transport: httpx.BaseTransport | None = None,
     drive_transport: httpx.BaseTransport | None = None,
     checkpoint_path: str = "worker_result.enc",
+    reporter: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Execute the cloud-to-cloud streaming job in RAM and return the final status dictionary."""
     worker_start = time.monotonic()
@@ -253,6 +297,19 @@ def run_worker_job(
         if current_offset > 0:
             req_headers["Range"] = f"bytes={current_offset}-"
 
+        if reporter is not None:
+            reporter.send(
+                {
+                    "status": "STREAMING",
+                    "bytes_transferred": current_offset,
+                    "progress_pct": round(current_offset / total_size * 100.0, 2)
+                    if (total_size and total_size > 0)
+                    else 0.0,
+                    "size_bytes": total_size,
+                    "resumable_session_uri": session_uri,
+                },
+                force=True,
+            )
         with httpx.Client(**src_kwargs) as src_client:
             with src_client.stream("GET", raw_url, headers=req_headers) as resp:
                 if resp.status_code in (401, 403):
@@ -264,6 +321,8 @@ def run_worker_job(
                         "error_message": f"Source returned HTTP {resp.status_code} (Signature Expired).",
                     }
                     write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
+                    if reporter is not None:
+                        reporter.send(err_state, force=True)
                     print(f"Job #{job_id} | Failed: Source returned HTTP {resp.status_code}")
                     return err_state
 
@@ -276,6 +335,8 @@ def run_worker_job(
                         "error_message": f"Source returned HTTP {resp.status_code}.",
                     }
                     write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
+                    if reporter is not None:
+                        reporter.send(err_state, force=True)
                     return err_state
 
                 if total_size is None:
@@ -289,6 +350,8 @@ def run_worker_job(
                 chunk_idx = (current_offset // chunk_size) + 1
                 ram_buf = bytearray()
                 completed_meta: dict[str, Any] | None = None
+                initial_offset = current_offset
+                stream_t0 = time.monotonic()
 
                 for net_bytes in resp.iter_bytes(chunk_size=256 * 1024):
                     ram_buf.extend(net_bytes)
@@ -344,7 +407,21 @@ def run_worker_job(
                             path=checkpoint_path,
                         )
 
-                        # Check 6-hour GitHub Actions runtime window
+                        if reporter is not None:
+                            elapsed = max(1.0, time.monotonic() - stream_t0)
+                            avg_bps = (current_offset - initial_offset) / elapsed
+                            remaining = (total_size - current_offset) if total_size else 0
+                            reporter.send(
+                                {
+                                    "status": "STREAMING",
+                                    "bytes_transferred": current_offset,
+                                    "progress_pct": round(pct, 2),
+                                    "speed_bps": round(avg_bps, 2),
+                                    "eta_seconds": int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0,
+                                    "size_bytes": total_size,
+                                    "resumable_session_uri": session_uri,
+                                }
+                            )
                         if (time.monotonic() - worker_start) >= max_runtime_seconds and not is_final:
                             pause_state = {
                                 "item_id": job_id,
@@ -355,6 +432,8 @@ def run_worker_job(
                                 "message": "Reached 6-hour worker window; session saved for seamless continuation.",
                             }
                             write_encrypted_checkpoint(secret_key, pause_state, path=checkpoint_path)
+                            if reporter is not None:
+                                reporter.send(pause_state, force=True)
                             print(
                                 f"Job #{job_id} | Reached 6h window at {format_bytes(current_offset)}; "
                                 "resumable session saved.",
@@ -402,8 +481,63 @@ def run_worker_job(
             "resumable_session_uri": None,
         }
         write_encrypted_checkpoint(secret_key, final_result, path=checkpoint_path)
+        if reporter is not None:
+            reporter.send(final_result, force=True)
         print(f"Job #{job_id} | Transfer Completed (100.0% - {format_bytes(current_offset)})", flush=True)
         return final_result
+
+
+def run_worker_job(
+    encrypted_payload: str,
+    secret_key: str,
+    *,
+    chunk_size: int = WORKER_RAM_CHUNK_BYTES,
+    max_runtime_seconds: int = DEFAULT_MAX_RUNTIME_SECONDS,
+    source_transport: httpx.BaseTransport | None = None,
+    drive_transport: httpx.BaseTransport | None = None,
+    checkpoint_path: str = "worker_result.enc",
+    report_url: str | None = None,
+) -> dict[str, Any]:
+    """Execute the cloud-to-cloud streaming job in RAM with live encrypted progress callbacks."""
+    payload = decrypt_payload(encrypted_payload, secret_key)
+    resolved_report_url = report_url or payload.get("report_url") or os.getenv("APP_REPORT_URL")
+    job_id = int(payload.get("item_id") or payload.get("job_id") or 1)
+    reporter = (
+        ProgressReporter(
+            resolved_report_url,
+            secret_key,
+            item_id=job_id,
+            transport=drive_transport,
+        )
+        if resolved_report_url
+        else None
+    )
+
+    try:
+        res = _run_worker_job_impl(
+            encrypted_payload,
+            secret_key,
+            chunk_size=chunk_size,
+            max_runtime_seconds=max_runtime_seconds,
+            source_transport=source_transport,
+            drive_transport=drive_transport,
+            checkpoint_path=checkpoint_path,
+            reporter=reporter,
+        )
+        if reporter is not None:
+            reporter.send(res, force=True)
+        return res
+    except Exception as exc:
+        if reporter is not None:
+            reporter.send(
+                {
+                    "item_id": job_id,
+                    "status": "FAILED",
+                    "error_message": f"Worker execution error: {type(exc).__name__}",
+                },
+                force=True,
+            )
+        raise
 
 
 def main() -> int:
