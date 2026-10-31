@@ -39,12 +39,24 @@ jobs:
           python -m pip install --upgrade pip --quiet
           python -m pip install -r requirements-worker.txt --quiet
 
+      - name: Optimize Linux TCP Network Stack & Enable Google BBR
+        run: |
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+          sudo sysctl -w net.core.rmem_max=33554432 2>/dev/null || true
+          sudo sysctl -w net.core.wmem_max=33554432 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null || true
+
       - name: Execute Encrypted RAM-to-Drive Stream
         env:
           JOB_ID: ${{ inputs.job_id }}
           ENCRYPTED_PAYLOAD: ${{ inputs.encrypted_payload }}
           WORKER_PAYLOAD_SECRET: ${{ secrets.WORKER_PAYLOAD_SECRET }}
-          WORKER_RAM_CHUNK_MB: ${{ vars.WORKER_RAM_CHUNK_MB || '64' }}
+          WORKER_RAM_CHUNK_MB: ${{ vars.WORKER_RAM_CHUNK_MB || '128' }}
         run: |
           python worker/run_transfer.py
 
