@@ -16,20 +16,22 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from typing import Any
 
 from cryptography.fernet import Fernet
 import httpx
 
-# Configurable RAM chunk size (default: 32 MB, multiple of Google Drive's 256 KB requirement)
+# Configurable RAM chunk size (default: 64 MB, multiple of Google Drive's 256 KB requirement)
 _chunk_mb_env = os.getenv("WORKER_RAM_CHUNK_MB")
 WORKER_RAM_CHUNK_BYTES = (
     max(1, int(_chunk_mb_env)) * 1024 * 1024
     if _chunk_mb_env and _chunk_mb_env.isdigit()
-    else 32 * 1024 * 1024
+    else 64 * 1024 * 1024
 )
 # 5.5 hours safety window before GitHub Actions 6-hour hard timeout
 DEFAULT_MAX_RUNTIME_SECONDS = int(os.getenv("MAX_WORKER_RUNTIME_SECONDS", str(5 * 3600 + 1800)))
@@ -365,142 +367,177 @@ def _run_worker_job_impl(
                 total_chunks = (
                     max(1, math.ceil(total_size / chunk_size)) if total_size else 1
                 )
-                chunk_idx = (current_offset // chunk_size) + 1
-                ram_buf = bytearray()
-                completed_meta: dict[str, Any] | None = None
                 initial_offset = current_offset
                 stream_t0 = time.monotonic()
-                chunk_dl_t0 = time.monotonic()
+                chunk_start_idx = (current_offset // chunk_size) + 1
 
-                for net_bytes in resp.iter_bytes(chunk_size=1024 * 1024):
-                    ram_buf.extend(net_bytes)
+                # Stage 1: Pipelined Double-Buffering Producer-Consumer
+                chunk_queue: queue.Queue[tuple[int, bytes, float] | None] = queue.Queue(maxsize=2)
+                stop_event = threading.Event()
+                producer_error: list[Exception | None] = [None]
 
-                    while len(ram_buf) >= chunk_size:
-                        piece = bytes(ram_buf[:chunk_size])
-                        del ram_buf[:chunk_size]
-
-                        dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
-                        dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
-
-                        is_final = bool(
-                            total_size is not None
-                            and (current_offset + len(piece)) >= total_size
-                        )
-                        t0 = time.monotonic()
-                        new_offset, done_meta = upload_chunk(
-                            session_uri,
-                            piece,
-                            start_byte=current_offset,
-                            total_size=total_size,
-                            is_final=is_final,
-                            client=drive_client,
-                        )
-                        dt = max(0.001, time.monotonic() - t0)
-                        drive_ul_mb_s = (len(piece) / (1024.0 * 1024.0)) / dt
-                        current_offset = new_offset
-                        pct = (
-                            (current_offset / total_size * 100.0)
-                            if (total_size and total_size > 0)
-                            else 0.0
-                        )
-                        elapsed = max(1.0, time.monotonic() - stream_t0)
-                        avg_bps = (current_offset - initial_offset) / elapsed
-                        overall_mb_s = avg_bps / (1024.0 * 1024.0)
-                        remaining = (total_size - current_offset) if total_size else 0
-                        eta_seconds = int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0
-                        eta_str = format_eta(eta_seconds)
-
-                        # Zero-Knowledge redacted console output (no URL, no filename, no headers)
-                        print(
-                            f"Job #{job_id} | Chunk {chunk_idx}/{total_chunks} "
-                            f"({pct:.1f}% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
-                            f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s] "
-                            f"| ETA {eta_str}",
-                            flush=True,
-                        )
-                        chunk_idx += 1
+                def producer_worker() -> None:
+                    try:
+                        ram_buf = bytearray()
+                        idx = chunk_start_idx
                         chunk_dl_t0 = time.monotonic()
 
-                        if done_meta is not None:
-                            completed_meta = done_meta
+                        for net_bytes in resp.iter_bytes(chunk_size=1024 * 1024):
+                            if stop_event.is_set():
+                                break
+                            ram_buf.extend(net_bytes)
 
-                        # Save encrypted progress checkpoint
-                        write_encrypted_checkpoint(
-                            secret_key,
-                            {
-                                "item_id": job_id,
-                                "status": "STREAMING",
-                                "bytes_transferred": current_offset,
-                                "progress_pct": round(pct, 2),
-                                "speed_bps": round(avg_bps, 2),
-                                "eta_seconds": eta_seconds,
-                                "resumable_session_uri": session_uri,
-                            },
-                            path=checkpoint_path,
-                        )
+                            while len(ram_buf) >= chunk_size and not stop_event.is_set():
+                                piece = bytes(ram_buf[:chunk_size])
+                                del ram_buf[:chunk_size]
+                                dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
+                                dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
 
-                        if reporter is not None:
-                            reporter.send(
-                                {
-                                    "status": "STREAMING",
-                                    "bytes_transferred": current_offset,
-                                    "progress_pct": round(pct, 2),
-                                    "speed_bps": round(avg_bps, 2),
-                                    "eta_seconds": eta_seconds,
-                                    "size_bytes": total_size,
-                                    "resumable_session_uri": session_uri,
-                                }
-                            )
-                        if (time.monotonic() - worker_start) >= max_runtime_seconds and not is_final:
-                            pause_state = {
-                                "item_id": job_id,
-                                "status": "PAUSED_WINDOW_LIMIT",
-                                "bytes_transferred": current_offset,
-                                "progress_pct": round(pct, 2),
-                                "resumable_session_uri": session_uri,
-                                "message": "Reached 6-hour worker window; session saved for seamless continuation.",
-                            }
-                            write_encrypted_checkpoint(secret_key, pause_state, path=checkpoint_path)
-                            if reporter is not None:
-                                reporter.send(pause_state, force=True)
-                            print(
-                                f"Job #{job_id} | Reached 6h window at {format_bytes(current_offset)}; "
-                                "resumable session saved.",
-                                flush=True,
-                            )
-                            return pause_state
+                                while not stop_event.is_set():
+                                    try:
+                                        chunk_queue.put((idx, piece, dl_mb_s), timeout=0.2)
+                                        break
+                                    except queue.Full:
+                                        continue
 
-                if len(ram_buf) > 0 and completed_meta is None:
-                    piece = bytes(ram_buf)
-                    ram_buf.clear()
-                    dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
-                    dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
+                                idx += 1
+                                chunk_dl_t0 = time.monotonic()
 
-                    if total_size is None:
-                        total_size = current_offset + len(piece)
+                        if len(ram_buf) > 0 and not stop_event.is_set():
+                            piece = bytes(ram_buf)
+                            ram_buf.clear()
+                            dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
+                            dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
+                            while not stop_event.is_set():
+                                try:
+                                    chunk_queue.put((idx, piece, dl_mb_s), timeout=0.2)
+                                    break
+                                except queue.Full:
+                                    continue
+                    except Exception as exc:
+                        producer_error[0] = exc
+                    finally:
+                        while not stop_event.is_set():
+                            try:
+                                chunk_queue.put(None, timeout=0.2)
+                                break
+                            except queue.Full:
+                                if stop_event.is_set():
+                                    break
+
+                prod_thread = threading.Thread(target=producer_worker, name="StreamProducer", daemon=True)
+                prod_thread.start()
+
+                completed_meta: dict[str, Any] | None = None
+
+                while True:
+                    item = None
+                    while not stop_event.is_set():
+                        try:
+                            item = chunk_queue.get(timeout=0.2)
+                            break
+                        except queue.Empty:
+                            if not prod_thread.is_alive():
+                                break
+
+                    if item is None:
+                        if producer_error[0] is not None:
+                            stop_event.set()
+                            prod_thread.join(timeout=2.0)
+                            raise producer_error[0]
+                        break
+
+                    chunk_idx, piece, dl_mb_s = item
+                    is_final = bool(
+                        total_size is not None
+                        and (current_offset + len(piece)) >= total_size
+                    )
                     t0 = time.monotonic()
                     new_offset, done_meta = upload_chunk(
                         session_uri,
                         piece,
                         start_byte=current_offset,
                         total_size=total_size,
-                        is_final=True,
+                        is_final=is_final,
                         client=drive_client,
                     )
                     dt = max(0.001, time.monotonic() - t0)
                     drive_ul_mb_s = (len(piece) / (1024.0 * 1024.0)) / dt
                     current_offset = new_offset
-                    if done_meta is not None:
-                        completed_meta = done_meta
+                    pct = (
+                        (current_offset / total_size * 100.0)
+                        if (total_size and total_size > 0)
+                        else 0.0
+                    )
                     elapsed = max(1.0, time.monotonic() - stream_t0)
                     avg_bps = (current_offset - initial_offset) / elapsed
                     overall_mb_s = avg_bps / (1024.0 * 1024.0)
+                    remaining = (total_size - current_offset) if total_size else 0
+                    eta_seconds = int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0
+                    eta_str = format_eta(eta_seconds)
+
+                    # Zero-Knowledge redacted console output (no URL, no filename, no headers)
                     print(
                         f"Job #{job_id} | Chunk {chunk_idx}/{total_chunks} "
-                        f"(100.0% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
-                        f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s]",
+                        f"({pct:.1f}% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
+                        f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s] "
+                        f"| ETA {eta_str}",
                         flush=True,
                     )
+
+                    if done_meta is not None:
+                        completed_meta = done_meta
+
+                    # Save encrypted progress checkpoint
+                    write_encrypted_checkpoint(
+                        secret_key,
+                        {
+                            "item_id": job_id,
+                            "status": "STREAMING",
+                            "bytes_transferred": current_offset,
+                            "progress_pct": round(pct, 2),
+                            "speed_bps": round(avg_bps, 2),
+                            "eta_seconds": eta_seconds,
+                            "resumable_session_uri": session_uri,
+                        },
+                        path=checkpoint_path,
+                    )
+
+                    if reporter is not None:
+                        reporter.send(
+                            {
+                                "status": "STREAMING",
+                                "bytes_transferred": current_offset,
+                                "progress_pct": round(pct, 2),
+                                "speed_bps": round(avg_bps, 2),
+                                "eta_seconds": eta_seconds,
+                                "size_bytes": total_size,
+                                "resumable_session_uri": session_uri,
+                            }
+                        )
+                    if (time.monotonic() - worker_start) >= max_runtime_seconds and not is_final:
+                        stop_event.set()
+                        prod_thread.join(timeout=3.0)
+                        pause_state = {
+                            "item_id": job_id,
+                            "status": "PAUSED_WINDOW_LIMIT",
+                            "bytes_transferred": current_offset,
+                            "progress_pct": round(pct, 2),
+                            "resumable_session_uri": session_uri,
+                            "message": "Reached 6-hour worker window; session saved for seamless continuation.",
+                        }
+                        write_encrypted_checkpoint(secret_key, pause_state, path=checkpoint_path)
+                        if reporter is not None:
+                            reporter.send(pause_state, force=True)
+                        print(
+                            f"Job #{job_id} | Reached 6h window at {format_bytes(current_offset)}; "
+                            "resumable session saved.",
+                            flush=True,
+                        )
+                        return pause_state
+
+                stop_event.set()
+                prod_thread.join(timeout=3.0)
 
         file_id = (completed_meta or {}).get("id") or f"gdrive_{job_id}"
         web_link = (completed_meta or {}).get("webViewLink") or (
