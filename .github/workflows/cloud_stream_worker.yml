@@ -45,7 +45,7 @@ jobs:
           ENCRYPTED_PAYLOAD: ${{ inputs.encrypted_payload }}
           WORKER_PAYLOAD_SECRET: ${{ secrets.WORKER_PAYLOAD_SECRET }}
           WORKER_RAM_CHUNK_MB: ${{ vars.WORKER_RAM_CHUNK_MB || '32' }}
-          WORKER_CONCURRENCY: ${{ vars.WORKER_CONCURRENCY || '3' }}
+          WORKER_CONCURRENCY: ${{ vars.WORKER_CONCURRENCY || '1' }}
         run: |
           python worker/run_transfer.py
 
