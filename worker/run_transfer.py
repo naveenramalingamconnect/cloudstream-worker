@@ -255,6 +255,7 @@ def _run_worker_job_impl(
     drive_transport: httpx.BaseTransport | None = None,
     checkpoint_path: str = "worker_result.enc",
     reporter: ProgressReporter | None = None,
+    live_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute the cloud-to-cloud streaming job in RAM and return the final status dictionary."""
     worker_start = time.monotonic()
@@ -282,6 +283,9 @@ def _run_worker_job_impl(
 
     access_token = ensure_access_token(token_bundle)
     current_offset = int(payload.get("bytes_transferred") or 0)
+    if live_state is not None:
+        live_state["bytes_transferred"] = current_offset
+        live_state["resumable_session_uri"] = session_uri
 
     with httpx.Client(**drive_kwargs) as drive_client:
         if session_uri:
@@ -313,9 +317,9 @@ def _run_worker_job_impl(
             )
             current_offset = 0
 
-        req_headers = dict(custom_headers)
-        if current_offset > 0:
-            req_headers["Range"] = f"bytes={current_offset}-"
+        if live_state is not None:
+            live_state["bytes_transferred"] = current_offset
+            live_state["resumable_session_uri"] = session_uri
 
         if reporter is not None:
             reporter.send(
@@ -330,214 +334,295 @@ def _run_worker_job_impl(
                 },
                 force=True,
             )
-        with httpx.Client(**src_kwargs) as src_client:
-            with src_client.stream("GET", raw_url, headers=req_headers) as resp:
-                if resp.status_code in (401, 403):
-                    err_state = {
-                        "item_id": job_id,
-                        "status": "FAILED",
-                        "bytes_transferred": current_offset,
-                        "resumable_session_uri": session_uri,
-                        "error_message": f"Source returned HTTP {resp.status_code} (Signature Expired).",
-                    }
-                    write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
-                    if reporter is not None:
-                        reporter.send(err_state, force=True)
-                    print(f"Job #{job_id} | Failed: Source returned HTTP {resp.status_code}")
-                    return err_state
 
-                if resp.status_code not in (200, 206):
-                    err_state = {
-                        "item_id": job_id,
-                        "status": "FAILED",
-                        "bytes_transferred": current_offset,
-                        "resumable_session_uri": session_uri,
-                        "error_message": f"Source returned HTTP {resp.status_code}.",
-                    }
-                    write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
-                    if reporter is not None:
-                        reporter.send(err_state, force=True)
-                    return err_state
+        MAX_SOURCE_RETRIES = 10
+        retry_count = 0
+        initial_offset = current_offset
+        stream_t0 = time.monotonic()
+        completed_meta: dict[str, Any] | None = None
 
-                if total_size is None:
-                    cl = resp.headers.get("Content-Length")
-                    if cl and cl.isdigit():
-                        total_size = current_offset + int(cl)
-
-                total_chunks = (
-                    max(1, math.ceil(total_size / chunk_size)) if total_size else 1
+        while total_size is None or current_offset < total_size:
+            if (time.monotonic() - worker_start) >= max_runtime_seconds:
+                pause_state = {
+                    "item_id": job_id,
+                    "status": "PAUSED_WINDOW_LIMIT",
+                    "bytes_transferred": current_offset,
+                    "progress_pct": round(current_offset / total_size * 100.0, 2)
+                    if (total_size and total_size > 0)
+                    else 0.0,
+                    "resumable_session_uri": session_uri,
+                    "message": "Reached 6-hour worker window; session saved for seamless continuation.",
+                }
+                write_encrypted_checkpoint(secret_key, pause_state, path=checkpoint_path)
+                if reporter is not None:
+                    reporter.send(pause_state, force=True)
+                print(
+                    f"Job #{job_id} | Reached 6h window at {format_bytes(current_offset)}; "
+                    "resumable session saved.",
+                    flush=True,
                 )
-                initial_offset = current_offset
-                stream_t0 = time.monotonic()
-                chunk_start_idx = (current_offset // chunk_size) + 1
+                return pause_state
 
-                # Stage 1: Pipelined Double-Buffering Producer-Consumer
-                chunk_queue: queue.Queue[tuple[int, bytes, float] | None] = queue.Queue(maxsize=2)
-                stop_event = threading.Event()
-                producer_error: list[Exception | None] = [None]
+            req_headers = dict(custom_headers)
+            if current_offset > 0:
+                req_headers["Range"] = f"bytes={current_offset}-"
 
-                def producer_worker() -> None:
-                    try:
-                        ram_buf = bytearray()
-                        idx = chunk_start_idx
-                        chunk_dl_t0 = time.monotonic()
+            try:
+                with httpx.Client(**src_kwargs) as src_client:
+                    with src_client.stream("GET", raw_url, headers=req_headers) as resp:
+                        if resp.status_code in (401, 403):
+                            err_state = {
+                                "item_id": job_id,
+                                "status": "FAILED",
+                                "bytes_transferred": current_offset,
+                                "resumable_session_uri": session_uri,
+                                "error_message": f"Source returned HTTP {resp.status_code} (Signature Expired).",
+                            }
+                            write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
+                            if reporter is not None:
+                                reporter.send(err_state, force=True)
+                            print(f"Job #{job_id} | Failed: Source returned HTTP {resp.status_code}")
+                            return err_state
 
-                        for net_bytes in resp.iter_bytes(chunk_size=1024 * 1024):
-                            if stop_event.is_set():
-                                break
-                            ram_buf.extend(net_bytes)
+                        if resp.status_code not in (200, 206):
+                            err_state = {
+                                "item_id": job_id,
+                                "status": "FAILED",
+                                "bytes_transferred": current_offset,
+                                "resumable_session_uri": session_uri,
+                                "error_message": f"Source returned HTTP {resp.status_code}.",
+                            }
+                            write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
+                            if reporter is not None:
+                                reporter.send(err_state, force=True)
+                            return err_state
 
-                            while len(ram_buf) >= chunk_size and not stop_event.is_set():
-                                piece = bytes(ram_buf[:chunk_size])
-                                del ram_buf[:chunk_size]
-                                dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
-                                dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
+                        if total_size is None:
+                            cl = resp.headers.get("Content-Length")
+                            if cl and cl.isdigit():
+                                total_size = current_offset + int(cl)
 
-                                while not stop_event.is_set():
-                                    try:
-                                        chunk_queue.put((idx, piece, dl_mb_s), timeout=0.2)
-                                        break
-                                    except queue.Full:
-                                        continue
+                        total_chunks = (
+                            max(1, math.ceil(total_size / chunk_size)) if total_size else 1
+                        )
+                        chunk_start_idx = (current_offset // chunk_size) + 1
 
-                                idx += 1
+                        # Stage 1: Pipelined Double-Buffering Producer-Consumer
+                        chunk_queue: queue.Queue[tuple[int, bytes, float] | None] = queue.Queue(maxsize=2)
+                        stop_event = threading.Event()
+                        producer_error: list[Exception | None] = [None]
+
+                        def producer_worker() -> None:
+                            try:
+                                ram_buf = bytearray()
+                                idx = chunk_start_idx
                                 chunk_dl_t0 = time.monotonic()
 
-                        if len(ram_buf) > 0 and not stop_event.is_set():
-                            piece = bytes(ram_buf)
-                            ram_buf.clear()
-                            dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
-                            dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
-                            while not stop_event.is_set():
-                                try:
-                                    chunk_queue.put((idx, piece, dl_mb_s), timeout=0.2)
-                                    break
-                                except queue.Full:
-                                    continue
-                    except Exception as exc:
-                        producer_error[0] = exc
-                    finally:
-                        while not stop_event.is_set():
-                            try:
-                                chunk_queue.put(None, timeout=0.2)
-                                break
-                            except queue.Full:
-                                if stop_event.is_set():
-                                    break
+                                for net_bytes in resp.iter_bytes(chunk_size=1024 * 1024):
+                                    if stop_event.is_set():
+                                        break
+                                    ram_buf.extend(net_bytes)
 
-                prod_thread = threading.Thread(target=producer_worker, name="StreamProducer", daemon=True)
-                prod_thread.start()
+                                    while len(ram_buf) >= chunk_size and not stop_event.is_set():
+                                        piece = bytes(ram_buf[:chunk_size])
+                                        del ram_buf[:chunk_size]
+                                        dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
+                                        dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
 
-                completed_meta: dict[str, Any] | None = None
+                                        while not stop_event.is_set():
+                                            try:
+                                                chunk_queue.put((idx, piece, dl_mb_s), timeout=0.2)
+                                                break
+                                            except queue.Full:
+                                                continue
 
-                while True:
-                    item = None
-                    while not stop_event.is_set():
+                                        idx += 1
+                                        chunk_dl_t0 = time.monotonic()
+
+                                if len(ram_buf) > 0 and not stop_event.is_set():
+                                    piece = bytes(ram_buf)
+                                    ram_buf.clear()
+                                    dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
+                                    dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
+                                    while not stop_event.is_set():
+                                        try:
+                                            chunk_queue.put((idx, piece, dl_mb_s), timeout=0.2)
+                                            break
+                                        except queue.Full:
+                                            continue
+                            except Exception as exc:
+                                producer_error[0] = exc
+                            finally:
+                                while not stop_event.is_set():
+                                    try:
+                                        chunk_queue.put(None, timeout=0.2)
+                                        break
+                                    except queue.Full:
+                                        if stop_event.is_set():
+                                            break
+
+                        prod_thread = threading.Thread(target=producer_worker, name="StreamProducer", daemon=True)
+                        prod_thread.start()
+
                         try:
-                            item = chunk_queue.get(timeout=0.2)
-                            break
-                        except queue.Empty:
-                            if not prod_thread.is_alive():
-                                break
+                            while True:
+                                item = None
+                                while not stop_event.is_set():
+                                    try:
+                                        item = chunk_queue.get(timeout=0.2)
+                                        break
+                                    except queue.Empty:
+                                        if not prod_thread.is_alive():
+                                            break
 
-                    if item is None:
-                        if producer_error[0] is not None:
+                                if item is None:
+                                    if producer_error[0] is not None:
+                                        stop_event.set()
+                                        prod_thread.join(timeout=2.0)
+                                        raise producer_error[0]
+                                    break
+
+                                chunk_idx, piece, dl_mb_s = item
+                                is_final = bool(
+                                    total_size is not None
+                                    and (current_offset + len(piece)) >= total_size
+                                )
+                                t0 = time.monotonic()
+                                new_offset, done_meta = upload_chunk(
+                                    session_uri,
+                                    piece,
+                                    start_byte=current_offset,
+                                    total_size=total_size,
+                                    is_final=is_final,
+                                    client=drive_client,
+                                )
+                                dt = max(0.001, time.monotonic() - t0)
+                                drive_ul_mb_s = (len(piece) / (1024.0 * 1024.0)) / dt
+                                current_offset = new_offset
+                                retry_count = 0  # Successfully uploaded a chunk, reset transient retry count
+                                if live_state is not None:
+                                    live_state["bytes_transferred"] = current_offset
+
+                                pct = (
+                                    (current_offset / total_size * 100.0)
+                                    if (total_size and total_size > 0)
+                                    else 0.0
+                                )
+                                elapsed = max(1.0, time.monotonic() - stream_t0)
+                                avg_bps = (current_offset - initial_offset) / elapsed
+                                overall_mb_s = avg_bps / (1024.0 * 1024.0)
+                                remaining = (total_size - current_offset) if total_size else 0
+                                eta_seconds = int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0
+                                eta_str = format_eta(eta_seconds)
+
+                                # Zero-Knowledge redacted console output (no URL, no filename, no headers)
+                                print(
+                                    f"Job #{job_id} | Chunk {chunk_idx}/{total_chunks} "
+                                    f"({pct:.1f}% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
+                                    f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s] "
+                                    f"| ETA {eta_str}",
+                                    flush=True,
+                                )
+
+                                if done_meta is not None:
+                                    completed_meta = done_meta
+
+                                # Save encrypted progress checkpoint
+                                write_encrypted_checkpoint(
+                                    secret_key,
+                                    {
+                                        "item_id": job_id,
+                                        "status": "STREAMING",
+                                        "bytes_transferred": current_offset,
+                                        "progress_pct": round(pct, 2),
+                                        "speed_bps": round(avg_bps, 2),
+                                        "eta_seconds": eta_seconds,
+                                        "size_bytes": total_size,
+                                        "resumable_session_uri": session_uri,
+                                    },
+                                    path=checkpoint_path,
+                                )
+
+                                if reporter is not None:
+                                    reporter.send(
+                                        {
+                                            "status": "STREAMING",
+                                            "bytes_transferred": current_offset,
+                                            "progress_pct": round(pct, 2),
+                                            "speed_bps": round(avg_bps, 2),
+                                            "eta_seconds": eta_seconds,
+                                            "size_bytes": total_size,
+                                            "resumable_session_uri": session_uri,
+                                        }
+                                    )
+                                if (time.monotonic() - worker_start) >= max_runtime_seconds and not is_final:
+                                    stop_event.set()
+                                    prod_thread.join(timeout=3.0)
+                                    pause_state = {
+                                        "item_id": job_id,
+                                        "status": "PAUSED_WINDOW_LIMIT",
+                                        "bytes_transferred": current_offset,
+                                        "progress_pct": round(pct, 2),
+                                        "resumable_session_uri": session_uri,
+                                        "message": "Reached 6-hour worker window; session saved for seamless continuation.",
+                                    }
+                                    write_encrypted_checkpoint(secret_key, pause_state, path=checkpoint_path)
+                                    if reporter is not None:
+                                        reporter.send(pause_state, force=True)
+                                    print(
+                                        f"Job #{job_id} | Reached 6h window at {format_bytes(current_offset)}; "
+                                        "resumable session saved.",
+                                        flush=True,
+                                    )
+                                    return pause_state
+                        finally:
                             stop_event.set()
-                            prod_thread.join(timeout=2.0)
-                            raise producer_error[0]
-                        break
+                            prod_thread.join(timeout=3.0)
 
-                    chunk_idx, piece, dl_mb_s = item
-                    is_final = bool(
-                        total_size is not None
-                        and (current_offset + len(piece)) >= total_size
-                    )
-                    t0 = time.monotonic()
-                    new_offset, done_meta = upload_chunk(
-                        session_uri,
-                        piece,
-                        start_byte=current_offset,
-                        total_size=total_size,
-                        is_final=is_final,
-                        client=drive_client,
-                    )
-                    dt = max(0.001, time.monotonic() - t0)
-                    drive_ul_mb_s = (len(piece) / (1024.0 * 1024.0)) / dt
-                    current_offset = new_offset
-                    pct = (
-                        (current_offset / total_size * 100.0)
-                        if (total_size and total_size > 0)
-                        else 0.0
-                    )
-                    elapsed = max(1.0, time.monotonic() - stream_t0)
-                    avg_bps = (current_offset - initial_offset) / elapsed
-                    overall_mb_s = avg_bps / (1024.0 * 1024.0)
-                    remaining = (total_size - current_offset) if total_size else 0
-                    eta_seconds = int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0
-                    eta_str = format_eta(eta_seconds)
+            except (httpx.TransportError, httpx.HTTPError, ConnectionError, OSError) as exc:
+                retry_count += 1
+                if retry_count > MAX_SOURCE_RETRIES:
+                    err_state = {
+                        "item_id": job_id,
+                        "status": "FAILED",
+                        "bytes_transferred": current_offset,
+                        "resumable_session_uri": session_uri,
+                        "error_message": f"Exceeded {MAX_SOURCE_RETRIES} retries on source error: {type(exc).__name__}",
+                    }
+                    write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
+                    if reporter is not None:
+                        reporter.send(err_state, force=True)
+                    raise RuntimeError(err_state["error_message"]) from exc
 
-                    # Zero-Knowledge redacted console output (no URL, no filename, no headers)
-                    print(
-                        f"Job #{job_id} | Chunk {chunk_idx}/{total_chunks} "
-                        f"({pct:.1f}% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
-                        f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s] "
-                        f"| ETA {eta_str}",
-                        flush=True,
-                    )
-
+                # Query Google Drive to confirm the exact byte offset it safely received
+                try:
+                    rec_offset, done_meta = query_session_offset(session_uri, total_size, drive_client)
                     if done_meta is not None:
                         completed_meta = done_meta
+                        current_offset = total_size or rec_offset
+                        break
+                    current_offset = rec_offset
+                    if live_state is not None:
+                        live_state["bytes_transferred"] = current_offset
+                except Exception:
+                    pass
 
-                    # Save encrypted progress checkpoint
-                    write_encrypted_checkpoint(
-                        secret_key,
-                        {
-                            "item_id": job_id,
-                            "status": "STREAMING",
-                            "bytes_transferred": current_offset,
-                            "progress_pct": round(pct, 2),
-                            "speed_bps": round(avg_bps, 2),
-                            "eta_seconds": eta_seconds,
-                            "resumable_session_uri": session_uri,
-                        },
-                        path=checkpoint_path,
-                    )
+                backoff = min(30, 2 ** min(retry_count, 5))
+                print(
+                    f"Job #{job_id} | Transient source disconnect ({type(exc).__name__}) at "
+                    f"{format_bytes(current_offset)}. Reconnecting in {backoff}s (attempt {retry_count}/{MAX_SOURCE_RETRIES})...",
+                    flush=True,
+                )
+                time.sleep(backoff)
+                continue
 
-                    if reporter is not None:
-                        reporter.send(
-                            {
-                                "status": "STREAMING",
-                                "bytes_transferred": current_offset,
-                                "progress_pct": round(pct, 2),
-                                "speed_bps": round(avg_bps, 2),
-                                "eta_seconds": eta_seconds,
-                                "size_bytes": total_size,
-                                "resumable_session_uri": session_uri,
-                            }
-                        )
-                    if (time.monotonic() - worker_start) >= max_runtime_seconds and not is_final:
-                        stop_event.set()
-                        prod_thread.join(timeout=3.0)
-                        pause_state = {
-                            "item_id": job_id,
-                            "status": "PAUSED_WINDOW_LIMIT",
-                            "bytes_transferred": current_offset,
-                            "progress_pct": round(pct, 2),
-                            "resumable_session_uri": session_uri,
-                            "message": "Reached 6-hour worker window; session saved for seamless continuation.",
-                        }
-                        write_encrypted_checkpoint(secret_key, pause_state, path=checkpoint_path)
-                        if reporter is not None:
-                            reporter.send(pause_state, force=True)
-                        print(
-                            f"Job #{job_id} | Reached 6h window at {format_bytes(current_offset)}; "
-                            "resumable session saved.",
-                            flush=True,
-                        )
-                        return pause_state
-
-                stop_event.set()
-                prod_thread.join(timeout=3.0)
+        if completed_meta is None and (total_size is None or current_offset >= total_size):
+            try:
+                rec_offset, done_meta = query_session_offset(session_uri, total_size, drive_client)
+                if done_meta is not None:
+                    completed_meta = done_meta
+            except Exception:
+                pass
 
         file_id = (completed_meta or {}).get("id") or f"gdrive_{job_id}"
         web_link = (completed_meta or {}).get("webViewLink") or (
@@ -585,6 +670,11 @@ def run_worker_job(
         else None
     )
 
+    live_state: dict[str, Any] = {
+        "bytes_transferred": int(payload.get("bytes_transferred") or 0),
+        "resumable_session_uri": payload.get("resumable_session_uri"),
+    }
+
     try:
         res = _run_worker_job_impl(
             encrypted_payload,
@@ -595,6 +685,7 @@ def run_worker_job(
             drive_transport=drive_transport,
             checkpoint_path=checkpoint_path,
             reporter=reporter,
+            live_state=live_state,
         )
         if reporter is not None:
             reporter.send(res, force=True)
@@ -605,6 +696,8 @@ def run_worker_job(
                 {
                     "item_id": job_id,
                     "status": "FAILED",
+                    "bytes_transferred": live_state.get("bytes_transferred", 0),
+                    "resumable_session_uri": live_state.get("resumable_session_uri"),
                     "error_message": f"Worker execution error: {type(exc).__name__}",
                 },
                 force=True,
