@@ -39,11 +39,12 @@ jobs:
           python -m pip install --upgrade pip --quiet
           python -m pip install -r requirements-worker.txt --quiet
 
-      - name: Execute Encrypted RAM-to-Drive Stream (32 MB Chunks)
+      - name: Execute Encrypted RAM-to-Drive Stream
         env:
           JOB_ID: ${{ inputs.job_id }}
           ENCRYPTED_PAYLOAD: ${{ inputs.encrypted_payload }}
           WORKER_PAYLOAD_SECRET: ${{ secrets.WORKER_PAYLOAD_SECRET }}
+          WORKER_RAM_CHUNK_MB: ${{ vars.WORKER_RAM_CHUNK_MB || '32' }}
         run: |
           python worker/run_transfer.py
 
