@@ -24,8 +24,13 @@ from typing import Any
 from cryptography.fernet import Fernet
 import httpx
 
-# 32 MB RAM chunk size (128 * 256 KB — exact multiple of Google Drive's 256 KB requirement)
-WORKER_RAM_CHUNK_BYTES = 32 * 1024 * 1024
+# Configurable RAM chunk size (default: 32 MB, multiple of Google Drive's 256 KB requirement)
+_chunk_mb_env = os.getenv("WORKER_RAM_CHUNK_MB")
+WORKER_RAM_CHUNK_BYTES = (
+    max(1, int(_chunk_mb_env)) * 1024 * 1024
+    if _chunk_mb_env and _chunk_mb_env.isdigit()
+    else 32 * 1024 * 1024
+)
 # 5.5 hours safety window before GitHub Actions 6-hour hard timeout
 DEFAULT_MAX_RUNTIME_SECONDS = int(os.getenv("MAX_WORKER_RUNTIME_SECONDS", str(5 * 3600 + 1800)))
 
@@ -46,6 +51,19 @@ def format_bytes(num_bytes: int | None) -> str:
         val /= 1024.0
         idx += 1
     return f"{val:.2f} {units[idx]}"
+
+
+def format_eta(sec: int | None) -> str:
+    if sec is None or sec <= 0:
+        return "--"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h}h {m}m"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def decrypt_payload(encrypted_payload: str, secret_key: str) -> dict[str, Any]:
@@ -352,13 +370,17 @@ def _run_worker_job_impl(
                 completed_meta: dict[str, Any] | None = None
                 initial_offset = current_offset
                 stream_t0 = time.monotonic()
+                chunk_dl_t0 = time.monotonic()
 
-                for net_bytes in resp.iter_bytes(chunk_size=256 * 1024):
+                for net_bytes in resp.iter_bytes(chunk_size=1024 * 1024):
                     ram_buf.extend(net_bytes)
 
                     while len(ram_buf) >= chunk_size:
                         piece = bytes(ram_buf[:chunk_size])
                         del ram_buf[:chunk_size]
+
+                        dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
+                        dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
 
                         is_final = bool(
                             total_size is not None
@@ -374,21 +396,30 @@ def _run_worker_job_impl(
                             client=drive_client,
                         )
                         dt = max(0.001, time.monotonic() - t0)
-                        mb_per_s = (len(piece) / (1024.0 * 1024.0)) / dt
+                        drive_ul_mb_s = (len(piece) / (1024.0 * 1024.0)) / dt
                         current_offset = new_offset
                         pct = (
                             (current_offset / total_size * 100.0)
                             if (total_size and total_size > 0)
                             else 0.0
                         )
+                        elapsed = max(1.0, time.monotonic() - stream_t0)
+                        avg_bps = (current_offset - initial_offset) / elapsed
+                        overall_mb_s = avg_bps / (1024.0 * 1024.0)
+                        remaining = (total_size - current_offset) if total_size else 0
+                        eta_seconds = int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0
+                        eta_str = format_eta(eta_seconds)
+
                         # Zero-Knowledge redacted console output (no URL, no filename, no headers)
                         print(
                             f"Job #{job_id} | Chunk {chunk_idx}/{total_chunks} "
                             f"({pct:.1f}% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
-                            f"@ {mb_per_s:.1f} MB/s",
+                            f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s] "
+                            f"| ETA {eta_str}",
                             flush=True,
                         )
                         chunk_idx += 1
+                        chunk_dl_t0 = time.monotonic()
 
                         if done_meta is not None:
                             completed_meta = done_meta
@@ -401,23 +432,21 @@ def _run_worker_job_impl(
                                 "status": "STREAMING",
                                 "bytes_transferred": current_offset,
                                 "progress_pct": round(pct, 2),
-                                "speed_bps": round(len(piece) / dt, 2),
+                                "speed_bps": round(avg_bps, 2),
+                                "eta_seconds": eta_seconds,
                                 "resumable_session_uri": session_uri,
                             },
                             path=checkpoint_path,
                         )
 
                         if reporter is not None:
-                            elapsed = max(1.0, time.monotonic() - stream_t0)
-                            avg_bps = (current_offset - initial_offset) / elapsed
-                            remaining = (total_size - current_offset) if total_size else 0
                             reporter.send(
                                 {
                                     "status": "STREAMING",
                                     "bytes_transferred": current_offset,
                                     "progress_pct": round(pct, 2),
                                     "speed_bps": round(avg_bps, 2),
-                                    "eta_seconds": int(remaining / avg_bps) if avg_bps > 0 and remaining > 0 else 0,
+                                    "eta_seconds": eta_seconds,
                                     "size_bytes": total_size,
                                     "resumable_session_uri": session_uri,
                                 }
@@ -444,6 +473,9 @@ def _run_worker_job_impl(
                 if len(ram_buf) > 0 and completed_meta is None:
                     piece = bytes(ram_buf)
                     ram_buf.clear()
+                    dl_dt = max(0.001, time.monotonic() - chunk_dl_t0)
+                    dl_mb_s = (len(piece) / (1024.0 * 1024.0)) / dl_dt
+
                     if total_size is None:
                         total_size = current_offset + len(piece)
                     t0 = time.monotonic()
@@ -456,14 +488,17 @@ def _run_worker_job_impl(
                         client=drive_client,
                     )
                     dt = max(0.001, time.monotonic() - t0)
-                    mb_per_s = (len(piece) / (1024.0 * 1024.0)) / dt
+                    drive_ul_mb_s = (len(piece) / (1024.0 * 1024.0)) / dt
                     current_offset = new_offset
                     if done_meta is not None:
                         completed_meta = done_meta
+                    elapsed = max(1.0, time.monotonic() - stream_t0)
+                    avg_bps = (current_offset - initial_offset) / elapsed
+                    overall_mb_s = avg_bps / (1024.0 * 1024.0)
                     print(
                         f"Job #{job_id} | Chunk {chunk_idx}/{total_chunks} "
                         f"(100.0% - {format_bytes(current_offset)} / {format_bytes(total_size)}) "
-                        f"@ {mb_per_s:.1f} MB/s",
+                        f"@ {overall_mb_s:.1f} MB/s [DL: {dl_mb_s:.1f} MB/s | Drive: {drive_ul_mb_s:.1f} MB/s]",
                         flush=True,
                     )
 
