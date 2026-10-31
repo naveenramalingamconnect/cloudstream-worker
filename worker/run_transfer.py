@@ -26,12 +26,12 @@ from typing import Any
 from cryptography.fernet import Fernet
 import httpx
 
-# Configurable RAM chunk size (default: 64 MB, multiple of Google Drive's 256 KB requirement)
+# Configurable RAM chunk size (default: 128 MB, multiple of Google Drive's 256 KB requirement)
 _chunk_mb_env = os.getenv("WORKER_RAM_CHUNK_MB")
 WORKER_RAM_CHUNK_BYTES = (
     max(1, int(_chunk_mb_env)) * 1024 * 1024
     if _chunk_mb_env and _chunk_mb_env.isdigit()
-    else 64 * 1024 * 1024
+    else 128 * 1024 * 1024
 )
 # 5.5 hours safety window before GitHub Actions 6-hour hard timeout
 DEFAULT_MAX_RUNTIME_SECONDS = int(os.getenv("MAX_WORKER_RUNTIME_SECONDS", str(5 * 3600 + 1800)))
