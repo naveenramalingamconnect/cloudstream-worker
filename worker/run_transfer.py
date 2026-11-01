@@ -41,6 +41,62 @@ GOOGLE_DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files"
 RANGE_HEADER_RE = re.compile(r"bytes=0-(\d+)", re.IGNORECASE)
 
 
+class GoogleDriveQuotaError(RuntimeError):
+    """Raised when Google Drive daily upload quota (750 GB) is exceeded."""
+    pass
+
+
+class GoogleDriveAPIError(RuntimeError):
+    """Raised for sanitized Google Drive API errors."""
+    pass
+
+
+def parse_drive_error(resp: httpx.Response, action: str = "Drive API") -> RuntimeError:
+    reason = ""
+    message = ""
+    try:
+        data = resp.json()
+        err = data.get("error", {})
+        message = err.get("message", "")
+        errors = err.get("errors", [])
+        if errors and isinstance(errors, list):
+            reason = errors[0].get("reason", "")
+    except Exception:
+        pass
+
+    msg_lower = (message or "").lower()
+    reason_lower = (reason or "").lower()
+    if resp.status_code == 403 and (
+        reason in ("userRateLimitExceeded", "rateLimitExceeded", "dailyLimitExceeded", "storageQuotaExceeded")
+        or "rate limit" in msg_lower
+        or "rate limit" in reason_lower
+        or "quota" in msg_lower
+        or "quota" in reason_lower
+        or "user rate limit exceeded" in msg_lower
+    ):
+        return GoogleDriveQuotaError(
+            "Google Drive daily upload limit (750 GB) exceeded (userRateLimitExceeded). "
+            "Rolling 24-hour quota limit reached."
+        )
+
+    if resp.status_code == 429:
+        return GoogleDriveQuotaError(
+            "Google Drive rate limit exceeded (HTTP 429). Please wait before retrying."
+        )
+
+    if resp.status_code == 404:
+        return GoogleDriveAPIError(
+            f"{action}: Resumable session not found or expired (HTTP 404)."
+        )
+
+    if resp.status_code in (401, 403):
+        return GoogleDriveAPIError(
+            f"{action}: Authentication or permission error (HTTP {resp.status_code})."
+        )
+
+    return GoogleDriveAPIError(f"{action} failed with HTTP {resp.status_code}.")
+
+
 def format_bytes(num_bytes: int | None) -> str:
     if num_bytes is None or num_bytes < 0:
         return "Unknown"
@@ -186,7 +242,7 @@ def initiate_resumable_session(
         json=metadata,
     )
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Drive session init failed with HTTP {resp.status_code}.")
+        raise parse_drive_error(resp, "Drive session init")
     loc = resp.headers.get("Location") or resp.headers.get("location")
     if not loc:
         raise RuntimeError("Drive session init missing Location header.")
@@ -209,7 +265,7 @@ def query_session_offset(
         if m:
             return int(m.group(1)) + 1, None
         return 0, None
-    raise RuntimeError(f"Session offset query returned HTTP {resp.status_code}.")
+    raise parse_drive_error(resp, "Session offset query")
 
 
 def upload_chunk(
@@ -242,7 +298,7 @@ def upload_chunk(
         if m:
             return int(m.group(1)) + 1, None
         return end_byte + 1, None
-    raise RuntimeError(f"Chunk upload failed at offset {start_byte} with HTTP {resp.status_code}.")
+    raise parse_drive_error(resp, f"Chunk upload at offset {start_byte}")
 
 
 def _run_worker_job_impl(
@@ -307,6 +363,8 @@ def _run_worker_job_impl(
                     print(f"Job #{job_id} | Already completed (100.0%)")
                     return result
                 current_offset = recovered_offset
+            except GoogleDriveQuotaError:
+                raise
             except Exception:
                 session_uri = None
                 current_offset = 0
@@ -691,17 +749,23 @@ def run_worker_job(
             reporter.send(res, force=True)
         return res
     except Exception as exc:
+        if isinstance(exc, (GoogleDriveQuotaError, GoogleDriveAPIError)):
+            err_msg = str(exc)
+        else:
+            err_msg = f"Worker execution error: {type(exc).__name__}"
+        err_state = {
+            "item_id": job_id,
+            "status": "FAILED",
+            "bytes_transferred": live_state.get("bytes_transferred", 0),
+            "resumable_session_uri": live_state.get("resumable_session_uri"),
+            "error_message": err_msg,
+        }
+        try:
+            write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
+        except Exception:
+            pass
         if reporter is not None:
-            reporter.send(
-                {
-                    "item_id": job_id,
-                    "status": "FAILED",
-                    "bytes_transferred": live_state.get("bytes_transferred", 0),
-                    "resumable_session_uri": live_state.get("resumable_session_uri"),
-                    "error_message": f"Worker execution error: {type(exc).__name__}",
-                },
-                force=True,
-            )
+            reporter.send(err_state, force=True)
         raise
 
 
@@ -715,6 +779,9 @@ def main() -> int:
     try:
         res = run_worker_job(encrypted_payload, secret_key)
         return 0 if res.get("status") in ("COMPLETED", "PAUSED_WINDOW_LIMIT") else 2
+    except (GoogleDriveQuotaError, GoogleDriveAPIError) as exc:
+        print(f"Worker execution error: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         # Never print raw exception message if it might contain URLs; print only class name
         print(f"Worker execution error ({type(exc).__name__}).", file=sys.stderr)
