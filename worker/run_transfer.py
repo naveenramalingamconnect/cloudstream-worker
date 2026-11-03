@@ -66,18 +66,29 @@ def parse_drive_error(resp: httpx.Response, action: str = "Drive API") -> Runtim
 
     msg_lower = (message or "").lower()
     reason_lower = (reason or "").lower()
-    if resp.status_code == 403 and (
-        reason in ("userRateLimitExceeded", "rateLimitExceeded", "dailyLimitExceeded", "storageQuotaExceeded")
-        or "rate limit" in msg_lower
-        or "rate limit" in reason_lower
-        or "quota" in msg_lower
-        or "quota" in reason_lower
-        or "user rate limit exceeded" in msg_lower
-    ):
-        return GoogleDriveQuotaError(
-            "Google Drive daily upload limit (750 GB) exceeded (userRateLimitExceeded). "
-            "Rolling 24-hour quota limit reached."
-        )
+    if resp.status_code == 403:
+        if reason == "storageQuotaExceeded" or "storage quota" in msg_lower:
+            return GoogleDriveQuotaError(
+                "Google Drive storage space full (storageQuotaExceeded). "
+                "Free up space or upgrade your Google Drive storage plan."
+            )
+        if reason == "dailyLimitExceeded":
+            return GoogleDriveQuotaError(
+                "Google Cloud Project daily API request limit exceeded (dailyLimitExceeded). "
+                "Please wait for the daily project quota reset or check your GCP Console."
+            )
+        if (
+            reason in ("userRateLimitExceeded", "rateLimitExceeded")
+            or "rate limit" in msg_lower
+            or "rate limit" in reason_lower
+            or "quota" in msg_lower
+            or "quota" in reason_lower
+            or "user rate limit exceeded" in msg_lower
+        ):
+            return GoogleDriveQuotaError(
+                "Google Drive daily upload limit (750 GB) exceeded (userRateLimitExceeded). "
+                "Rolling 24-hour quota limit reached."
+            )
 
     if resp.status_code == 429:
         return GoogleDriveQuotaError(
@@ -363,9 +374,11 @@ def _run_worker_job_impl(
                     print(f"Job #{job_id} | Already completed (100.0%)")
                     return result
                 current_offset = recovered_offset
-            except GoogleDriveQuotaError:
-                raise
-            except Exception:
+            except Exception as exc:
+                print(
+                    f"Job #{job_id} | Saved resumable session is expired or invalidated ({exc}). "
+                    f"Discarding dead session and initializing fresh upload session from byte 0."
+                )
                 session_uri = None
                 current_offset = 0
 
