@@ -441,18 +441,18 @@ def _run_worker_job_impl(
             try:
                 with httpx.Client(**src_kwargs) as src_client:
                     with src_client.stream("GET", raw_url, headers=req_headers) as resp:
-                        if resp.status_code in (401, 403):
+                        if resp.status_code in (401, 403, 410):
                             err_state = {
                                 "item_id": job_id,
                                 "status": "FAILED",
                                 "bytes_transferred": current_offset,
                                 "resumable_session_uri": session_uri,
-                                "error_message": f"Source returned HTTP {resp.status_code} (Signature Expired).",
+                                "error_message": f"Source returned HTTP {resp.status_code} (Download Link Expired). Use 'Update Pre-Signed URL & Resume' to continue.",
                             }
                             write_encrypted_checkpoint(secret_key, err_state, path=checkpoint_path)
                             if reporter is not None:
                                 reporter.send(err_state, force=True)
-                            print(f"Job #{job_id} | Failed: Source returned HTTP {resp.status_code}")
+                            print(f"Job #{job_id} | Failed: Source returned HTTP {resp.status_code} (Download Link Expired)")
                             return err_state
 
                         if resp.status_code not in (200, 206):
