@@ -455,6 +455,13 @@ def _run_worker_job_impl(
                             print(f"Job #{job_id} | Failed: Source returned HTTP {resp.status_code} (Download Link Expired)")
                             return err_state
 
+                        if resp.status_code in (429, 500, 502, 503, 504):
+                            raise httpx.HTTPStatusError(
+                                f"Transient source error HTTP {resp.status_code}.",
+                                request=resp.request,
+                                response=resp,
+                            )
+
                         if resp.status_code not in (200, 206):
                             err_state = {
                                 "item_id": job_id,
